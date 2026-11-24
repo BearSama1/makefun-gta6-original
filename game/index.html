@@ -1,0 +1,1596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEON TIDE — a typhoon-night delivery</title>
+<!--
+  NEON TIDE — fully offline, self-contained, original assets only.
+  Everything (city, art, audio) is generated procedurally in this file.
+  The hook: carry emergency medical supplies across a neon harbour city
+  as a typhoon pushes floodwater up from the sea. Take the fast flooded
+  canal route, or the long safe hillside route.
+-->
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#0a0d14;overflow:hidden}
+  canvas{display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+
+/* ============================ 1. CORE ============================ */
+const TAU=Math.PI*2;
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+const dist=(x1,y1,x2,y2)=>Math.hypot(x2-x1,y2-y1);
+const dist2=(x1,y1,x2,y2)=>{const dx=x2-x1,dy=y2-y1;return dx*dx+dy*dy;};
+const angDiff=(a,b)=>{let d=(b-a)%TAU;if(d>Math.PI)d-=TAU;if(d<-Math.PI)d+=TAU;return d;};
+
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+let W=0,H=0;
+function resize(){W=canvas.width=innerWidth;H=canvas.height=innerHeight;}
+addEventListener('resize',resize);resize();
+
+// Seeded RNG: fixed seed => identical city on every run, so quick-restart
+// is fair (same routes, same flood basins, same collectibles).
+let _seed=0x7ea51;
+function srand(){_seed|=0;_seed=(_seed+0x6D2B79F5)|0;let t=Math.imul(_seed^_seed>>>15,1|_seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}
+const sr=(a,b)=>a+srand()*(b-a);
+const sri=(a,b)=>Math.floor(sr(a,b+1));
+const spick=arr=>arr[sri(0,arr.length-1)];
+const rr=(a,b)=>a+Math.random()*(b-a); // unseeded, ambience only
+
+/* ======================= 2. WORLD CONSTANTS ====================== */
+const WORLD=4000;      // world is WORLD x WORLD
+const CELL=400;        // one city cell
+const ROADW=90;        // road width
+const GRIDB=9;         // blocks per side (between the 10 roads)
+const EG=40, ECELL=100;// elevation grid: 40x40 cells of 100px
+const rc=i=>200+400*i; // road centre line i (0..9) => 200,600,...,3800
+
+// Mission-critical places (all sit on road intersections).
+const DEPOT={x:3400,y:3400};    // SE harbourfront (low, floods first)
+const HOSPITAL={x:600,y:1800};  // west ridge (high, dry)
+const CANAL={x0:1330,x1:1470,y0:1500}; // vertical canal over road x=1400
+const BRIDGE={y0:1755,y1:1845};        // bridge on road y=1800
+
+// Suggested routes (polylines on roads) shown on the minimap.
+const FAST_ROUTE=[[3400,3400],[1800,3400],[1800,1800],[600,1800]];
+const SAFE_ROUTE=[[3400,3400],[3400,1000],[600,1000],[600,1800]];
+
+/* ======================== 3. CITY STATE ========================== */
+const elevG=[],seaG=[],bridgeG=[];   // EG x EG
+const blocks=[];                     // GRIDB x GRIDB
+const cars=[],cats=[],lanterns=[],parts=[],puddleGlows=[];
+const landmarks=[
+  {x:3400,y:3400,r:240,name:'Harbour Depot',col:'#ffb84d'},
+  {x:600, y:1800,r:240,name:'Mercy Ridge Hospital',col:'#ff5d5d'},
+  {x:2200,y:2200,r:260,name:'The Typhoon Spire',col:'#66e0ff'},
+  {x:1400,y:1800,r:220,name:'Lantern Bridge',col:'#ff9de2'},
+  {x:3400,y:3000,r:220,name:'Old Fish Market',col:'#5dffc3'},
+  {x:3400,y:600, r:240,name:'Storm Shrine',col:'#ff7a5d'},
+  {x:2200,y:2600,r:220,name:'Lucky Cat Arcade',col:'#d78bff'}
+];
+const discovered=new Set(); // landmark discoveries persist across restarts
+
+const BUILD_COLS=['#5b6577','#6b5d70','#5d6b5f','#72675a','#5f6b7d','#6d5f66','#67725f','#5a5f6e'];
+const NEON_COLS=['#39f2ff','#ff4dd2','#b6ff3d','#ffae3d','#7a6bff','#ff6b6b'];
+
+function genCity(){
+  // ---- elevation: NW high, SE (harbour) low, plus hill bumps, canal carve
+  for(let gi=0;gi<EG;gi++){
+    elevG[gi]=[];seaG[gi]=[];bridgeG[gi]=[];
+    for(let gj=0;gj<EG;gj++){
+      const wx=gi*ECELL+ECELL/2, wy=gj*ECELL+ECELL/2;
+      let e=1-dist(wx,wy,200,200)/5372;                 // base slope to NW
+      e+=0.35*Math.exp(-dist2(wx,wy,3400,700)/(700*700)); // NE shrine hill
+      e+=0.22*Math.exp(-dist2(wx,wy,600,1800)/(520*520)); // hospital ridge
+      e-=0.06*srand();                                    // noise
+      let sea=wy>3820;
+      if(sea)e=0;
+      if(wx>CANAL.x0-70&&wx<CANAL.x1+70&&wy>CANAL.y0)e=Math.min(e,0.05); // canal
+      let bridge=wx>1080&&wx<1520&&wy>BRIDGE.y0-40&&wy<BRIDGE.y1+40;
+      if(bridge)e=Math.max(e,0.85);
+      e=clamp(e,0,1);
+      elevG[gi][gj]=e;seaG[gi][gj]=sea;bridgeG[gi][gj]=bridge;
+    }
+  }
+  // ---- blocks: buildings / parks / lots
+  for(let i=0;i<GRIDB;i++){
+    blocks[i]=[];
+    for(let j=0;j<GRIDB;j++){
+      const ox=rc(i)+45, oy=rc(j)+45, S=310;
+      const r=srand();
+      const b={type:r<0.12?'park':r<0.22?'lot':'built',buildings:[],trees:[],ox,oy};
+      if(b.type==='built'){
+        const mode=sri(0,3), m=18, bx=ox+m, by=oy+m, bs=S-2*m;
+        const rects=[];
+        if(mode===0)rects.push([bx,by,bs,bs]);
+        else if(mode===1){const w1=bs*sr(0.35,0.65);
+          rects.push([bx,by,w1-4,bs],[bx+w1+4,by,bs-w1-4,bs]);}
+        else if(mode===2){const h1=bs*sr(0.35,0.65);
+          rects.push([bx,by,bs,h1-4],[bx,by+h1+4,bs,bs-h1-4]);}
+        else{const w1=bs*sr(0.4,0.6),h1=bs*sr(0.4,0.6);
+          rects.push([bx,by,w1-4,h1-4],[bx+w1+4,by,bs-w1-4,h1-4],
+                     [bx,by+h1+4,w1-4,bs-h1-4],[bx+w1+4,by+h1+4,bs-w1-4,bs-h1-4]);}
+        // taller towers toward downtown (near the spire)
+        const dt=1-clamp(dist(ox,oy,2200,2400)/1900,0,1);
+        for(const rc2 of rects){
+          if(rc2[2]<26||rc2[3]<26)continue;
+          const hgt=sr(28,64)+dt*sr(10,130);
+          b.buildings.push({x:rc2[0],y:rc2[1],w:rc2[2],h:rc2[3],
+            cx:rc2[0]+rc2[2]/2,cy:rc2[1]+rc2[3]/2,
+            color:spick(BUILD_COLS),hgt,
+            neon:srand()<0.5?spick(NEON_COLS):null});
+        }
+      }else if(b.type==='park'){
+        const n=sri(4,8);
+        for(let k=0;k<n;k++)
+          b.trees.push({x:ox+sr(26,S-26),y:oy+sr(26,S-26),r:sr(11,20)});
+      }
+      blocks[i][j]=b;
+    }
+  }
+}
+
+/* ---- elevation queries ---- */
+function cellIJ(x,y){return[clamp(Math.floor(x/ECELL),0,EG-1),clamp(Math.floor(y/ECELL),0,EG-1)];}
+function elevAt(x,y){const[i,j]=cellIJ(x,y);return elevG[i][j];}
+function isSeaAt(x,y){const[i,j]=cellIJ(x,y);return seaG[i][j];}
+function isBridgeAt(x,y){const[i,j]=cellIJ(x,y);return bridgeG[i][j];}
+function waterDepth(x,y){
+  if(isSeaAt(x,y))return 1;
+  if(isBridgeAt(x,y))return 0;
+  return clamp((waterLevel-elevAt(x,y))*2.5,0,1);
+}
+function pointInBuilding(x,y){
+  const i=clamp(Math.floor((x-200)/CELL),0,GRIDB-1), j=clamp(Math.floor((y-200)/CELL),0,GRIDB-1);
+  for(const bd of blocks[i][j].buildings)
+    if(x>bd.x&&x<bd.x+bd.w&&y>bd.y&&y<bd.y+bd.h)return true;
+  return false;
+}
+// circle vs buildings push-out; returns corrected position + hit flag
+function collideWorld(x,y,r){
+  let hit=false;
+  const i0=clamp(Math.floor((x-r-200)/CELL),0,GRIDB-1),i1=clamp(Math.floor((x+r-200)/CELL),0,GRIDB-1);
+  const j0=clamp(Math.floor((y-r-200)/CELL),0,GRIDB-1),j1=clamp(Math.floor((y+r-200)/CELL),0,GRIDB-1);
+  for(let i=i0;i<=i1;i++)for(let j=j0;j<=j1;j++){
+    for(const bd of blocks[i][j].buildings){
+      const cx=clamp(x,bd.x,bd.x+bd.w),cy=clamp(y,bd.y,bd.y+bd.h);
+      const dx=x-cx,dy=y-cy,d2=dx*dx+dy*dy;
+      if(d2<r*r){
+        let d=Math.sqrt(d2);
+        if(d<0.0001){x+=r;} // degenerate: shove east
+        else{const push=(r-d)/d;x+=dx*push;y+=dy*push;}
+        hit=true;
+      }
+    }
+  }
+  return{x,y,hit};
+}
+function forBlocksInRange(x0,y0,x1,y1,cb){
+  const i0=clamp(Math.floor((x0-200)/CELL),0,GRIDB-1),i1=clamp(Math.floor((x1-200)/CELL),0,GRIDB-1);
+  const j0=clamp(Math.floor((y0-200)/CELL),0,GRIDB-1),j1=clamp(Math.floor((y1-200)/CELL),0,GRIDB-1);
+  for(let i=i0;i<=i1;i++)for(let j=j0;j<=j1;j++)cb(blocks[i][j]);
+}
+// a walkable sidewalk point on the perimeter of block (i,j)
+function sidewalkPoint(i,j){
+  const b=blocks[i][j];
+  const side=sri(0,3),t=sr(24,286);
+  if(side===0)return{x:b.ox+t,y:b.oy+12};
+  if(side===1)return{x:b.ox+t,y:b.oy+298};
+  if(side===2)return{x:b.ox+12,y:b.oy+t};
+  return{x:b.ox+298,y:b.oy+t};
+}
+function drySidewalkPoint(){
+  for(let t=0;t<60;t++){
+    const i=sri(0,GRIDB-1),j=sri(0,GRIDB-1);
+    const p=sidewalkPoint(i,j);
+    if(!pointInBuilding(p.x,p.y)&&waterDepth(p.x,p.y)<0.15)return p;
+  }
+  return{x:2200,y:2312};
+}
+
+/* ---- props: cats, lanterns, parked cars ---- */
+function spawnProps(){
+  _seed=0xC0FFEE; // props get their own fixed seed: identical layout every run
+  cars.length=0;cats.length=0;lanterns.length=0;
+  const van={x:2200,y:2400,angle:-Math.PI/2,speed:0,hp:100,stall:0,
+    dead:false,deadT:0,color:'#f2b632',van:true};
+  cars.push(van);
+  const CAR_COLS=['#b23a3a','#3a6ab2','#c9c9c9','#d3b23a','#4a9a4a','#8a5ab2','#d3722a','#2a2f3a'];
+  for(let k=0;k<15;k++){
+    // park along a random road lane
+    const vert=srand()<0.5, ri=sri(0,9);
+    const along=sr(400,3600), off=(srand()<0.5?-1:1)*26;
+    let x,y,angle;
+    if(vert){x=rc(ri)+off;y=along;angle=srand()<0.5?Math.PI/2:-Math.PI/2;}
+    else{y=rc(ri)+off;x=along;angle=srand()<0.5?0:Math.PI;}
+    if(pointInBuilding(x,y))continue;
+    if(dist(x,y,2200,2400)<160)continue; // keep spawn area clear
+    if(waterDepth(x,y)>0.3)continue;      // don't park cars in flood zones
+    cars.push({x,y,angle,speed:0,hp:100,stall:0,dead:false,deadT:0,
+      color:spick(CAR_COLS),van:false});
+  }
+  for(let k=0;k<6;k++){
+    const p=drySidewalkPoint();
+    cats.push({x:p.x,y:p.y,a:sr(0,TAU),saved:false,t:sr(0,TAU)});
+  }
+  for(let k=0;k<16;k++){
+    const p=drySidewalkPoint();
+    lanterns.push({x:p.x,y:p.y,got:false,t:sr(0,TAU)});
+  }
+  // fictional customs carts (arcade trigger): one near the start, one by
+  // the spire, one on the hillside route — all roadside, never in the way
+  customsCarts.length=0;
+  customsCarts.push({x:3390,y:3160,looted:false});
+  customsCarts.push({x:2230,y:2560,looted:false});
+  customsCarts.push({x:640, y:980, looted:false});
+}
+
+/* ---- minimap base (prerendered once) ---- */
+const MM=220, mmScale=MM/WORLD;
+const mmBase=document.createElement('canvas');mmBase.width=mmBase.height=MM;
+const mmFlood=document.createElement('canvas');mmFlood.width=mmFlood.height=MM;
+function renderMinimapBase(){
+  const c=mmBase.getContext('2d');
+  c.fillStyle='#141821';c.fillRect(0,0,MM,MM);
+  const s=mmScale;
+  for(let gi=0;gi<EG;gi++)for(let gj=0;gj<EG;gj++){
+    if(seaG[gi][gj]){c.fillStyle='#123055';}
+    else if(bridgeG[gi][gj]){c.fillStyle='#6b4a33';}
+    else{const e=elevG[gi][gj];
+      c.fillStyle=`rgb(${Math.round(30+e*26)},${Math.round(34+e*24)},${Math.round(46+e*28)})`;}
+    c.fillRect(gi*ECELL*s,gj*ECELL*s,ECELL*s+1,ECELL*s+1);
+  }
+  c.strokeStyle='#3c4254';c.lineWidth=2;
+  for(let i=0;i<=9;i++){
+    c.beginPath();c.moveTo(rc(i)*s,0);c.lineTo(rc(i)*s,MM);c.stroke();
+    c.beginPath();c.moveTo(0,rc(i)*s);c.lineTo(MM,rc(i)*s);c.stroke();
+  }
+  c.fillStyle='#ffd23a';
+  for(const L of landmarks)c.fillRect(L.x*s-2,L.y*s-2,5,5);
+}
+function renderMinimapFlood(){
+  const c=mmFlood.getContext('2d');
+  c.clearRect(0,0,MM,MM);
+  const s=mmScale;
+  for(let gi=0;gi<EG;gi++)for(let gj=0;gj<EG;gj++){
+    if(bridgeG[gi][gj]||elevG[gi][gj]>=waterLevel)continue;
+    c.fillStyle='rgba(38,108,190,0.6)';
+    c.fillRect(gi*ECELL*s,gj*ECELL*s,ECELL*s+1,ECELL*s+1);
+  }
+}
+/* ========================== 4. AUDIO ============================= */
+// All procedural WebAudio — no files, fully offline.
+let AC=null,master=null,muted=false;
+let rainSrc=null,rainGain=null,windOsc=null,windGain=null;
+let engOsc=null,engGain=null,noiseBuf=null;
+function initAudio(){
+  if(AC)return;
+  try{
+    AC=new(window.AudioContext||window.webkitAudioContext)();
+    master=AC.createGain();master.gain.value=0.55;master.connect(AC.destination);
+    const len=AC.sampleRate*1.5;
+    noiseBuf=AC.createBuffer(1,len,AC.sampleRate);
+    const d=noiseBuf.getChannelData(0);
+    for(let i=0;i<len;i++)d[i]=Math.random()*2-1;
+    // rain: looped filtered noise
+    rainSrc=AC.createBufferSource();rainSrc.buffer=noiseBuf;rainSrc.loop=true;
+    const rf=AC.createBiquadFilter();rf.type='bandpass';rf.frequency.value=2400;rf.Q.value=0.4;
+    rainGain=AC.createGain();rainGain.gain.value=0.05;
+    rainSrc.connect(rf);rf.connect(rainGain);rainGain.connect(master);rainSrc.start();
+    // wind: slow LFO-modulated noise
+    const wsrc=AC.createBufferSource();wsrc.buffer=noiseBuf;wsrc.loop=true;wsrc.playbackRate.value=0.4;
+    const wf=AC.createBiquadFilter();wf.type='lowpass';wf.frequency.value=300;
+    windGain=AC.createGain();windGain.gain.value=0.05;
+    const lfo=AC.createOscillator();lfo.frequency.value=0.11;
+    const lfoG=AC.createGain();lfoG.gain.value=0.035;
+    lfo.connect(lfoG);lfoG.connect(windGain.gain);lfo.start();
+    wsrc.connect(wf);wf.connect(windGain);windGain.connect(master);wsrc.start();
+    windOsc=lfo;
+    // engine
+    engOsc=AC.createOscillator();engOsc.type='sawtooth';engOsc.frequency.value=50;
+    const ef=AC.createBiquadFilter();ef.type='lowpass';ef.frequency.value=420;
+    engGain=AC.createGain();engGain.gain.value=0;
+    engOsc.connect(ef);ef.connect(engGain);engGain.connect(master);engOsc.start();
+  }catch(e){AC=null;}
+}
+function sfx(kind){
+  if(!AC||muted)return;
+  const t=AC.currentTime;
+  if(kind==='chime'){
+    [880,1174].forEach((fr,i)=>{
+      const o=AC.createOscillator();o.type='sine';o.frequency.value=fr;
+      const g=AC.createGain();g.gain.setValueAtTime(0.001,t+i*0.09);
+      g.gain.linearRampToValueAtTime(0.16,t+i*0.09+0.02);
+      g.gain.exponentialRampToValueAtTime(0.001,t+i*0.09+0.5);
+      o.connect(g);g.connect(master);o.start(t+i*0.09);o.stop(t+i*0.09+0.52);
+    });
+  }else if(kind==='meow'){
+    const o=AC.createOscillator();o.type='triangle';
+    o.frequency.setValueAtTime(620,t);o.frequency.exponentialRampToValueAtTime(880,t+0.12);
+    o.frequency.exponentialRampToValueAtTime(540,t+0.3);
+    const g=AC.createGain();g.gain.setValueAtTime(0.001,t);
+    g.gain.linearRampToValueAtTime(0.14,t+0.04);
+    g.gain.exponentialRampToValueAtTime(0.001,t+0.32);
+    o.connect(g);g.connect(master);o.start(t);o.stop(t+0.34);
+  }else if(kind==='splash'){
+    const s=AC.createBufferSource();s.buffer=noiseBuf;s.playbackRate.value=0.9;
+    const f=AC.createBiquadFilter();f.type='bandpass';f.frequency.value=900;
+    const g=AC.createGain();g.gain.setValueAtTime(0.22,t);
+    g.gain.exponentialRampToValueAtTime(0.001,t+0.25);
+    s.connect(f);f.connect(g);g.connect(master);s.start(t);s.stop(t+0.26);
+  }else if(kind==='thunder'){
+    const s=AC.createBufferSource();s.buffer=noiseBuf;s.playbackRate.value=0.25;
+    const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=180;
+    const g=AC.createGain();g.gain.setValueAtTime(0.8,t);
+    g.gain.exponentialRampToValueAtTime(0.001,t+1.4);
+    s.connect(f);f.connect(g);g.connect(master);s.start(t);s.stop(t+1.45);
+  }else if(kind==='skid'){
+    const s=AC.createBufferSource();s.buffer=noiseBuf;s.playbackRate.value=0.7;
+    const f=AC.createBiquadFilter();f.type='bandpass';f.frequency.value=700;
+    const g=AC.createGain();g.gain.setValueAtTime(0.12,t);
+    g.gain.exponentialRampToValueAtTime(0.001,t+0.3);
+    s.connect(f);f.connect(g);g.connect(master);s.start(t);s.stop(t+0.31);
+  }else if(kind==='crash'){
+    const s=AC.createBufferSource();s.buffer=noiseBuf;s.playbackRate.value=0.5;
+    const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=500;
+    const g=AC.createGain();g.gain.setValueAtTime(0.4,t);
+    g.gain.exponentialRampToValueAtTime(0.001,t+0.35);
+    s.connect(f);f.connect(g);g.connect(master);s.start(t);s.stop(t+0.36);
+  }else if(kind==='win'){
+    [523,659,784,1046].forEach((fr,i)=>{
+      const o=AC.createOscillator();o.type='square';o.frequency.value=fr;
+      const g=AC.createGain();g.gain.setValueAtTime(0.001,t+i*0.13);
+      g.gain.linearRampToValueAtTime(0.15,t+i*0.13+0.02);
+      g.gain.exponentialRampToValueAtTime(0.001,t+i*0.13+0.4);
+      o.connect(g);g.connect(master);o.start(t+i*0.13);o.stop(t+i*0.13+0.42);
+    });
+  }else if(kind==='lose'){
+    [392,311,262].forEach((fr,i)=>{
+      const o=AC.createOscillator();o.type='square';o.frequency.value=fr;
+      const g=AC.createGain();g.gain.setValueAtTime(0.001,t+i*0.2);
+      g.gain.linearRampToValueAtTime(0.13,t+i*0.2+0.03);
+      g.gain.exponentialRampToValueAtTime(0.001,t+i*0.2+0.5);
+      o.connect(g);g.connect(master);o.start(t+i*0.2);o.stop(t+i*0.2+0.52);
+    });
+  }else if(kind==='door'){
+    const o=AC.createOscillator();o.type='square';o.frequency.value=140;
+    const g=AC.createGain();g.gain.setValueAtTime(0.12,t);
+    g.gain.exponentialRampToValueAtTime(0.001,t+0.1);
+    o.connect(g);g.connect(master);o.start(t);o.stop(t+0.11);
+  }
+}
+function updateEngineSound(){
+  if(!AC||!engGain)return;
+  if(player.inCar&&!muted&&state==='drive'){
+    const sp=Math.abs(player.inCar.speed);
+    engOsc.frequency.value=46+sp*0.5;
+    engGain.gain.value=0.045+Math.min(0.05,sp*0.00022);
+  }else engGain.gain.value=0;
+}
+
+/* ========================== 5. INPUT ============================= */
+const keys={};
+addEventListener('keydown',e=>{
+  if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code))e.preventDefault();
+  keys[e.code]=true;
+  if(e.code==='KeyM'){muted=!muted;showMsg(muted?'muted':'sound on');}
+  if(e.code==='KeyP'&&(state==='walk'||state==='drive'))paused=!paused;
+  if(e.code==='KeyR'&&(state==='won'||state==='lost'))quickRestart();
+  if(e.code==='KeyF'&&!paused&&(state==='walk'||state==='drive'))enterExitCar();
+  if(e.code==='KeyE'&&!paused&&(state==='walk'||state==='drive'))interact();
+});
+addEventListener('keyup',e=>keys[e.code]=false);
+addEventListener('blur',()=>{for(const k in keys)keys[k]=false;});
+
+/* ======================= 6. GAME STATE =========================== */
+let state='title';       // title | intro | walk | drive | won | lost
+let paused=false,time=0,missionTimer=0,runCount=0;
+let waterLevel=0.22;     // metres-ish; rises over the run
+let stormPhase=0;        // typhoon intensity 0..1
+let flashT=0,shakeT=0,shakeAmp=0;
+let msgs=[];
+function showMsg(t,dur){msgs.push({text:t,t:dur||3.2});if(msgs.length>4)msgs.shift();}
+const cam={x:3400,y:3400,zoom:1};
+const raindrops=[];      // screen-space rain
+const splashes=[];
+
+/* -- ambient traffic + the fictional customs-cart arcade layer ----------
+   Fully optional and separate from the storm relief mission: raiding a
+   cart only raises a visible "heat" meter and summons one harbour patrol
+   cart, which gives up on a timer or when you break away. It never
+   blocks, damages or resets the legal delivery route. -------------------- */
+const traffic=[];
+const customsCarts=[];
+let wanted=0;                 // heat stars 0..3 (fictional)
+let wantedT=0;const WANTED_MAX=22;
+let patrol=null;
+let saveTimer=0,storageOK=true;
+const SAVE_KEY='neontide-save-v1';
+
+const player={
+  x:3400,y:3560,a:-Math.PI/2,hp:100,stamina:1,inCar:null,
+  hasCargo:false,cargoHp:100,speedMul:1,stepT:0
+};
+
+/* ---- flood schedule ---- */
+const FLOOD_RATE=0.0034;   // waterLevel rise per second
+function floodDanger(){return clamp((waterLevel-0.30)/0.28,0,1);}
+
+/* ---- routes / mission ---- */
+let routeChoice=null;      // 'fast' | 'safe' | null (decided at gate)
+let gatePassed=false;
+function routeLens(){
+  const len=pts=>{let d=0;for(let i=1;i<pts.length;i++)d+=dist(pts[i-1][0],pts[i-1][1],pts[i][0],pts[i][1]);return d;};
+  return{fast:len(FAST_ROUTE),safe:len(SAFE_ROUTE)};
+}
+
+/* ====================== 7. SIMULATION =========================== */
+function enterExitCar(){
+  if(player.inCar){
+    const c=player.inCar;
+    // step out sideways
+    const sx=Math.cos(c.angle+Math.PI/2)*40, sy=Math.sin(c.angle+Math.PI/2)*40;
+    let nx=c.x+sx,ny=c.y+sy;
+    const cw=collideWorld(nx,ny,10);nx=cw.x;ny=cw.y;
+    player.x=nx;player.y=ny;player.inCar=null;
+    c.speed=0;state='walk';
+    sfx('door');
+  }else{
+    let best=null,bd=80*80;
+    for(const c of cars){
+      if(c.dead)continue;
+      const d=dist2(c.x,c.y,player.x,player.y);
+      if(d<bd){bd=d;best=c;}
+    }
+    if(!best){showMsg('no vehicle nearby');return;}
+    player.inCar=best;best.stall=0;state='drive';
+    sfx('door');
+  }
+}
+// mission phase helper
+function phase(){
+  if(!player.hasCargo)return'pickup';
+  if(!gatePassed)return'route';
+  return'deliver';
+}
+function interact(){
+  // cargo pickup at the spire plaza
+  if(!player.hasCargo&&dist2(player.x,player.y,2200,2400)<70*70){
+    player.hasCargo=true;player.cargoHp=100;
+    missionTimer=Math.max(missionTimer,10); // small extension when loaded
+    sfx('chime');
+    showMsg('EMERGENCY SUPPLIES LOADED — get them to Mercy Ridge Hospital',5);
+    showMsg('typhoon is pushing the tide in — choose your route',4.5);
+    return;
+  }
+  // delivery at the hospital
+  if(player.hasCargo&&dist2(player.x,player.y,HOSPITAL.x,HOSPITAL.y)<80*80){
+    finishMission();return;
+  }
+  // cats
+  for(const cat of cats){
+    if(!cat.saved&&dist2(cat.x,cat.y,player.x,player.y)<34*34){
+      cat.saved=true;sfx('meow');
+      showMsg('cat rescued! (bonus at delivery)');
+      return;
+    }
+  }
+  // lanterns
+  for(const l of lanterns){
+    if(!l.got&&dist2(l.x,l.y,player.x,player.y)<30*30){
+      l.got=true;sfx('chime');
+      showMsg('storm lantern collected (+cargo protection)');
+      player.speedMul=Math.min(1.12,player.speedMul+0.04);
+      return;
+    }
+  }
+  // fictional customs carts (optional arcade layer, separate from the mission)
+  for(const cart of customsCarts){
+    if(!cart.looted&&dist2(cart.x,cart.y,player.x,player.y)<38*38){
+      raidCart(cart);
+      return;
+    }
+  }
+}
+function finishMission(){
+  const danger=floodDanger();
+  const base=1200;
+  const cargoBonus=Math.round(player.cargoHp*6);      // up to 600
+  const timeLeft=Math.max(0,Math.round(missionTimer*8));
+  const riskBonus=routeChoice==='fast'?Math.round(300*(1-danger*0.5)):0;
+  const catBonus=cats.filter(c=>c.saved).length*90;
+  const total=base+cargoBonus+timeLeft+riskBonus+catBonus;
+  state='won';
+  sfx('win');
+  clearSave(); // a finished run is never offered as a continue
+  window._lastScore={total,cargoBonus,timeLeft,riskBonus,catBonus,
+    route:routeChoice||'safe',cargoHp:Math.round(player.cargoHp),
+    cats:cats.filter(c=>c.saved).length,danger};
+}
+function damageCargo(amt){
+  if(!player.hasCargo)return;
+  player.cargoHp=clamp(player.cargoHp-amt,0,100);
+  if(player.cargoHp<=0){
+    state='lost';window._lastScore={fail:'cargo',route:routeChoice};
+    sfx('lose');
+    clearSave();
+  }
+}
+
+/* ---- on foot ---- */
+function updateWalk(dt){
+  let mx=0,my=0;
+  if(keys['KeyW']||keys['ArrowUp'])my-=1;
+  if(keys['KeyS']||keys['ArrowDown'])my+=1;
+  if(keys['KeyA']||keys['ArrowLeft'])mx-=1;
+  if(keys['KeyD']||keys['ArrowRight'])mx+=1;
+  const sprint=(keys['ShiftLeft']||keys['ShiftRight'])&&player.stamina>0.02;
+  const wd=waterDepth(player.x,player.y);
+  let sp=150*player.speedMul;
+  if(sprint){sp*=1.62;player.stamina=Math.max(0,player.stamina-dt*0.3);}
+  else player.stamina=Math.min(1,player.stamina+dt*0.22);
+  sp*=(1-wd*0.62);           // wading is slow
+  if(player.hasCargo)sp*=0.9;
+  if(mx||my){
+    const l=Math.hypot(mx,my);mx/=l;my/=l;
+    player.x+=mx*sp*dt;player.y+=my*sp*dt;
+    player.a=Math.atan2(my,mx);
+    player.stepT+=dt*(sprint?11:7);
+    if(wd>0.25&&Math.random()<dt*6){
+      splashes.push({x:player.x,y:player.y,r:2,max:10,a:0.7});
+      if(Math.random()<0.3)sfx('splash');
+    }
+  }
+  const cw=collideWorld(player.x,player.y,10);
+  if(cw.hit){player.x=cw.x;player.y=cw.y;}
+  player.x=clamp(player.x,10,WORLD-10);player.y=clamp(player.y,10,WORLD-10);
+  // deep water on foot is deadly
+  if(!isBridgeAt(player.x,player.y)&&wd>0.8){
+    player.hp-=dt*22;flashT=Math.max(flashT,0.35);
+    if(player.hp<=0){state='lost';window._lastScore={fail:'drown'};sfx('lose');}
+  }else if(wd>0.3&&player.hasCargo){
+    damageCargo(dt*2.2); // wading soaks the supplies
+  }
+}
+
+/* ---- arcade car ---- */
+function updateCar(dt){
+  const c=player.inCar;
+  let throttle=0;
+  if(keys['KeyW']||keys['ArrowUp'])throttle=1;
+  if(keys['KeyS']||keys['ArrowDown'])throttle=(keys['KeyW']||keys['ArrowUp'])?0:-1;
+  const wd=waterDepth(c.x,c.y);
+  const inWater=wd>0.12&&!isBridgeAt(c.x,c.y);
+  let maxF=470,maxR=-150;
+  if(inWater){maxF*=1-0.45*wd;maxR*=1-0.3*wd;} // floods slow you down
+  if(throttle>0)c.speed=Math.min(maxF,c.speed+(inWater?200:330)*dt);
+  else if(throttle<0)c.speed=Math.max(maxR,c.speed-420*dt);
+  else c.speed*=Math.pow(0.4,dt);
+  if(keys['Space'])c.speed*=Math.pow(0.08,dt); // brake
+  let steer=0;
+  if(keys['KeyA']||keys['ArrowLeft'])steer=-1;
+  if(keys['KeyD']||keys['ArrowRight'])steer=1;
+  const sf=clamp(Math.abs(c.speed)/120,0,1)*(1-0.4*clamp(Math.abs(c.speed)/470,0,1));
+  const grip=inWater?0.55:1;
+  const turn=2.9*sf*grip*dt*Math.sign(c.speed||1);
+  c.angle+=steer*turn;
+  const nx=c.x+Math.cos(c.angle)*c.speed*dt;
+  const ny=c.y+Math.sin(c.angle)*c.speed*dt;
+  c.x=nx;c.y=ny;
+  // building crash
+  const cw=collideWorld(c.x,c.y,22);
+  if(cw.hit){
+    c.x=cw.x;c.y=cw.y;
+    const impact=Math.abs(c.speed);
+    if(impact>140){
+      sfx('crash');shakeT=0.25;shakeAmp=impact*0.02;
+      damageCargo(impact*0.02);
+      sparksFx(c.x,c.y,8);
+    }
+    c.speed*=-0.25;
+  }
+  // sea wall: world edge
+  if(c.x<20||c.x>WORLD-20||c.y<20||c.y>WORLD-10){
+    c.x=clamp(c.x,20,WORLD-20);c.y=clamp(c.y,20,WORLD-10);
+    c.speed*=-0.3;
+  }
+  // deep water: engine stall / drown
+  if(!isBridgeAt(c.x,c.y)&&wd>0.72){
+    c.stall+=dt;
+    c.speed*=Math.pow(0.05,dt);
+    if(c.stall>2.2){
+      state='lost';window._lastScore={fail:'flooded',route:routeChoice};
+      sfx('lose');
+    }
+  }else c.stall=Math.max(0,c.stall-dt*2);
+  // aquaplaning spray + skid sound
+  if(inWater&&Math.abs(c.speed)>120&&Math.random()<dt*14){
+    splashes.push({x:c.x+rr(-14,14),y:c.y+rr(-14,14),r:3,max:16,a:0.6});
+    if(Math.random()<0.25)sfx('splash');
+  }
+  if(!inWater&&Math.abs(c.speed)>250&&Math.abs(steer)>0&&Math.random()<dt*6)sfx('skid');
+  player.x=c.x;player.y=c.y;
+  // auto pick up cats/lanterns by driving near? no — on foot only, keeps E meaningful
+}
+
+/* ---- world updates ---- */
+function updateWorld(dt){
+  waterLevel=Math.min(0.94,waterLevel+FLOOD_RATE*dt*(0.7+stormPhase));
+  stormPhase=clamp(0.25+time/240,0.25,1);
+  floodMapT+=dt;
+  if(floodMapT>2){floodMapT=0;renderMinimapFlood();}
+  if(Math.random()<dt*(0.02+stormPhase*0.05)){
+    thunderT=0.01; // trigger a lightning flash
+    setTimeout(()=>sfx('thunder'),rr(200,900));
+  }
+  if(thunderT>0)thunderT+=dt;
+  if(thunderT>0.22)thunderT=0;
+  // mission timer only ticks once cargo is loaded
+  if(player.hasCargo&&state!=='won')missionTimer-=dt;
+  if(missionTimer<=0&&player.hasCargo&&(state==='walk'||state==='drive')){
+    state='lost';window._lastScore={fail:'time',route:routeChoice};sfx('lose');
+  }
+  // route gate check (crossing the canal bridge decides/records route)
+  if(player.hasCargo&&!gatePassed){
+    const onBridge=Math.abs(player.y-BRIDGE.y0-45)<70&&player.x>1100&&player.x<1560;
+    if(onBridge){gatePassed=true;routeChoice='fast';showMsg('FAST ROUTE — flooded canal districts ahead',4);}
+    else if(player.y<1150&&player.x>2200){ // went around the top
+      gatePassed=true;routeChoice='safe';showMsg('SAFE ROUTE — hillside switchbacks, longer but dry',4);
+    }
+  }
+  // puddle glows (reflections of neon in water) — regenerate occasionally
+  if(Math.random()<dt*3){
+    const p=drySidewalkPoint();
+    puddleGlows.push({x:p.x,y:p.y,t:0,col:spick(NEON_COLS)});
+  }
+  for(let i=puddleGlows.length-1;i>=0;i--){
+    puddleGlows[i].t+=dt;
+    if(puddleGlows[i].t>6)puddleGlows.splice(i,1);
+  }
+  // landmark discovery
+  for(const L of landmarks){
+    const key=L.name;
+    if(!discovered.has(key)&&dist2(player.x,player.y,L.x,L.y)<L.r*L.r){
+      discovered.add(key);
+      sfx('chime');
+      showMsg('discovered: '+L.name,4);
+    }
+  }
+  // splashes grow/fade
+  for(let i=splashes.length-1;i>=0;i--){
+    const s=splashes[i];
+    s.r+=dt*36;s.a-=dt*1.6;
+    if(s.a<=0)splashes.splice(i,1);
+  }
+  // particles
+  for(let i=parts.length-1;i>=0;i--){
+    const p=parts[i];p.life-=dt;
+    if(p.life<=0){parts.splice(i,1);continue;}
+    p.x+=p.vx*dt;p.y+=p.vy*dt;
+    p.vx*=Math.pow(0.1,dt);p.vy*=Math.pow(0.1,dt);
+  }
+  // messages
+  for(let i=msgs.length-1;i>=0;i--){msgs[i].t-=dt;if(msgs[i].t<=0)msgs.splice(i,1);}
+  flashT=Math.max(0,flashT-dt*1.4);
+  if(shakeT>0)shakeT-=dt;
+}
+function sparksFx(x,y,n){
+  for(let i=0;i<n;i++)parts.push({x,y,vx:rr(-200,200),vy:rr(-200,200),
+    life:rr(0.1,0.3),max:0.3,size:rr(1,3),color:'#9adcff'});
+}
+let thunderT=0,floodMapT=0;
+
+/* ---- camera ---- */
+function targetZoom(){
+  const base=Math.min(W,H)/860;
+  if(player.inCar)return base*lerp(1.0,0.78,clamp(Math.abs(player.inCar.speed)/470,0,1));
+  return base*1.05;
+}
+function updateCamera(dt){
+  const lookAhead=player.inCar?0.42:0.16;
+  const sp=player.inCar?player.inCar.speed:0;
+  const tx=player.x+(player.inCar?Math.cos(player.inCar.angle)*sp*lookAhead:0);
+  const ty=player.y+(player.inCar?Math.sin(player.inCar.angle)*sp*lookAhead:0);
+  cam.x=lerp(cam.x,tx,1-Math.pow(0.0012,dt));
+  cam.y=lerp(cam.y,ty,1-Math.pow(0.0012,dt));
+  cam.zoom=lerp(cam.zoom,targetZoom(),1-Math.pow(0.01,dt));
+}
+
+/* ================== 7b. TRAFFIC / CUSTOMS / PATROL ================= */
+/* Ambient traffic: cars driving the road grid on lanes, keeping to the
+   right, despawned when far. Pure ambience — they never chase, and they
+   brake for the player like they do for each other. */
+const TRAFFIC_COLS=['#b23a3a','#3a6ab2','#c9c9c9','#d3b23a','#4a9a4a','#8a5ab2','#d3722a'];
+function spawnTrafficCar(){
+  // pick a road segment near (but out of sight of) the camera ring
+  for(let t=0;t<14;t++){
+    const vert=Math.random()<0.5, ri=Math.floor(rr(0,10));
+    const along=rr(400,3600);
+    const dirSign=Math.random()<0.5?1:-1;
+    // right-hand lane offset for the travel direction
+    let x,y,dirX,dirY;
+    if(vert){
+      x=rc(ri)+ (dirSign>0?-26:26); // heading -y uses the west lane? keep right of travel
+      dirX=0;dirY=dirSign;
+      if(dirSign<0)x=rc(ri)-26; else x=rc(ri)+26;
+      y=along;
+    }else{
+      y=rc(ri)+(dirSign>0?26:-26);
+      if(dirSign<0)y=rc(ri)+26; else y=rc(ri)-26;
+      dirSign2:{}
+      x=along;dirX=dirSign;dirY=0;
+    }
+    // skip flooded segments and buildings
+    if(pointInBuilding(x,y))continue;
+    if(waterDepth(x,y)>0.15)continue;
+    const d=dist(x,y,cam.x,cam.y);
+    if(d<520||d>1250)continue;
+    traffic.push({x,y,dirX,dirY,speed:rr(95,135),hop:0,
+      color:TRAFFIC_COLS[Math.floor(rr(0,TRAFFIC_COLS.length))]});
+    return;
+  }
+}
+function updateTraffic(dt){
+  while(traffic.length<16)spawnTrafficCar();
+  for(let i=traffic.length-1;i>=0;i--){
+    const c=traffic[i];
+    // brake for cars/player ahead (simple probe)
+    let slow=false;
+    const fx=c.x+c.dirX*70,fy=c.y+c.dirY*70;
+    for(const o of traffic)if(o!==c&&dist2(o.x,o.y,fx,fy)<44*44){slow=true;break;}
+    if(!slow&&dist2(player.x,player.y,fx,fy)<40*40)slow=true;
+    if(!slow&&player.inCar&&dist2(player.inCar.x,player.inCar.y,fx,fy)<52*52)slow=true;
+    const wd=waterDepth(c.x,c.y);
+    if(wd>0.25)slow=true; // ambient drivers avoid deep water
+    const target=slow?0:110;
+    c.speed=lerp(c.speed,target,dt*(slow?7:1.3));
+    c.x+=c.dirX*c.speed*dt;c.y+=c.dirY*c.speed*dt;
+    // turn at intersections: snap-turn when crossing a road centre line
+    const onV=c.dirX!==0;
+    const cx=200+400*Math.round((c.x-200)/400);
+    const cy=200+400*Math.round((c.y-200)/400);
+    const crossingV=Math.abs(c.x-cx)<8&&onV;
+    const crossingH=Math.abs(c.y-cy)<8&&!onV;
+    const tryTurn=()=>{
+      c.hop+=dt;
+      if(c.hop>0.4){
+        c.hop=-rr(2,6); // cooldown before another possible turn
+        if(Math.random()<0.4){
+          const turnRight=Math.random()<0.5;
+          const nd=turnRight?{x:-c.dirY,y:c.dirX}:{x:c.dirY,y:-c.dirX};
+          // keep to the right lane of the new road
+          if(nd.x!==0){c.y=cy+(nd.x>0?-26:26);c.x=cx;}
+          else{c.x=cx+(nd.y>0?26:-26);c.y=cy;}
+          c.dirX=nd.x;c.dirY=nd.y;
+        }
+      }
+    };
+    if(crossingV&&c.speed>40)tryTurn();
+    if(crossingH&&c.speed>40)tryTurn();
+    // despawn far away
+    if(dist2(c.x,c.y,cam.x,cam.y)>1500*1500)traffic.splice(i,1);
+  }
+}
+function drawTraffic(){
+  for(const c of traffic){
+    ctx.save();ctx.translate(c.x,c.y);
+    ctx.rotate(Math.atan2(c.dirY,c.dirX));
+    ctx.fillStyle='rgba(0,0,0,0.3)';
+    rrect(-22,-11+3,44,22,5);ctx.fill();
+    ctx.fillStyle=c.color;
+    rrect(-22,-11,44,22,5);ctx.fill();
+    ctx.fillStyle='rgba(25,35,50,0.9)';
+    rrect(-6,-8,14,16,3);ctx.fill();
+    ctx.fillStyle='#ffe9a0';ctx.fillRect(20,-9,3,4);ctx.fillRect(20,5,3,4);
+    ctx.restore();
+  }
+}
+/* The fictional customs-cart heat layer. "Raiding" a cart is a pure
+   arcade trigger: it raises the wanted meter and summons one patrol
+   cart. No real-world tactics are represented, and nothing about the
+   legal relief mission changes. */
+function cartHeatLevel(){return Math.floor(clamp(wanted/WANTED_MAX*3,0,3));}
+function raidCart(cart){
+  cart.looted=true;
+  wanted=WANTED_MAX;wantedT=0;
+  sfx('chime');
+  showMsg('CUSTOMS CART RAIDED — patrol incoming! (purely optional)',4.5);
+  showMsg('break away or wait out the heat — your delivery is unaffected',4.5);
+  spawnPatrol();
+}
+function spawnPatrol(){
+  if(patrol)return;
+  // spawn on a road ring 600-800 from the player, heading their way
+  for(let t=0;t<20;t++){
+    const a=rr(0,TAU),d=rr(600,800);
+    let x=clamp(player.x+Math.cos(a)*d,220,3780);
+    let y=clamp(player.y+Math.sin(a)*d,220,3780);
+    // snap to nearest road centre
+    const rx=200+400*Math.round((x-200)/400);
+    const ry=200+400*Math.round((y-200)/400);
+    if(Math.abs(x-rx)<Math.abs(y-ry))x=rx;else y=ry;
+    if(pointInBuilding(x,y))continue;
+    if(waterDepth(x,y)>0.2)continue;
+    patrol={x,y,angle:Math.atan2(player.y-y,player.x-x),speed:0,lost:0};
+    return;
+  }
+  patrol={x:clamp(player.x+600,220,3780),y:player.y,angle:Math.PI,speed:0,lost:0};
+}
+function updatePatrol(dt){
+  // heat decays when you keep your distance; ticks down otherwise
+  if(patrol){
+    const d=dist(patrol.x,patrol.y,player.x,player.y);
+    if(d>430){patrol.lost+=dt;}else{patrol.lost=0;}
+    if(patrol.lost>4||wanted<=0){
+      patrol=null;
+      showMsg('the patrol gave up — heat fading',3);
+      return;
+    }
+    // arcade chase: steer toward the player, keep to roads loosely,
+    // slow in floodwater, never quite as fast as the player's van
+    const want=Math.atan2(player.y-patrol.y,player.x-patrol.x);
+    patrol.angle+=clamp(angDiff(patrol.angle,want),-2.2*dt,2.2*dt);
+    const wd=waterDepth(patrol.x,patrol.y);
+    const maxSp=(wd>0.2&&!isBridgeAt(patrol.x,patrol.y))?190:330;
+    patrol.speed=lerp(patrol.speed,maxSp,dt*1.4);
+    patrol.x+=Math.cos(patrol.angle)*patrol.speed*dt;
+    patrol.y+=Math.sin(patrol.angle)*patrol.speed*dt;
+    const cw=collideWorld(patrol.x,patrol.y,20);
+    if(cw.hit){patrol.x=cw.x;patrol.y=cw.y;patrol.speed*=0.5;}
+    patrol.x=clamp(patrol.x,20,WORLD-20);patrol.y=clamp(patrol.y,20,WORLD-20);
+    // close contact: a brief spin-out, never damage or mission loss
+    if(patrol.knockT===undefined)patrol.knockT=0;
+    patrol.knockT-=dt;
+    if(d<34&&patrol.knockT<=0){
+      patrol.knockT=2.5;
+      shakeT=0.2;shakeAmp=5;
+      sfx('crash');
+      showMsg('patrol side-swiped you! (no harm done — arcade only)',3);
+      // small shove apart
+      const dx=(player.x-patrol.x)/(d||1),dy=(player.y-patrol.y)/(d||1);
+      player.x+=dx*30;player.y+=dy*30;
+    }
+  }
+  if(wanted>0){
+    wantedT+=dt;
+    // decay after a short flash-in, faster once the patrol is gone
+    const decay=patrol?1.1:2.6;
+    if(wantedT>1.5)wanted=Math.max(0,wanted-dt*decay);
+  }
+}
+function drawCustoms(){
+  for(const cart of customsCarts){
+    if(cart.looted)continue;
+    ctx.save();ctx.translate(cart.x,cart.y);
+    // little market cart with a striped awning
+    ctx.fillStyle='rgba(0,0,0,0.35)';
+    rrect(-26,-16,52,32,4);ctx.fill();
+    ctx.fillStyle='#7a5230';rrect(-24,-14,48,28,3);ctx.fill();
+    // awning stripes
+    for(let k=0;k<6;k++){
+      ctx.fillStyle=k%2?'#ff5d5d':'#f2eec8';
+      ctx.fillRect(-24+k*8,-22,8,10);
+    }
+    ctx.fillStyle='#39f2ff';
+    ctx.font='bold 10px monospace';ctx.textAlign='center';
+    ctx.fillText('E',0,6);
+    ctx.restore();
+  }
+  if(patrol){
+    ctx.save();ctx.translate(patrol.x,patrol.y);ctx.rotate(patrol.angle);
+    ctx.fillStyle='rgba(0,0,0,0.35)';
+    rrect(-24,-12+3,48,24,5);ctx.fill();
+    ctx.fillStyle='#e8e8f0';
+    rrect(-24,-12,48,24,5);ctx.fill();
+    ctx.fillStyle='#2e4e8f';
+    rrect(-20,-10,10,20,2);ctx.fill();
+    // flashing light bar
+    const on=Math.floor(time*6)%2===0;
+    ctx.fillStyle=on?'#ff3a3a':'#3a6aff';ctx.fillRect(-6,-11,7,5);
+    ctx.fillStyle=on?'#3a6aff':'#ff3a3a';ctx.fillRect(-6,6,7,5);
+    ctx.fillStyle='#ffe9a0';ctx.fillRect(21,-9,3,4);ctx.fillRect(21,5,3,4);
+    ctx.restore();
+  }
+}
+/* Wanted stars HUD + minimap blip */
+function drawWanted(){
+  if(wanted<=0.01&&cartHeatLevel()<=0)return;
+  const stars=cartHeatLevel();
+  ctx.font='bold 30px monospace';ctx.textAlign='right';
+  let s='';
+  for(let i=0;i<3;i++)s+=i<stars?'★':'☆';
+  ctx.fillStyle='#ffd23a';
+  ctx.fillText(s,W-18,96);
+  if(patrol){
+    ctx.font='bold 13px monospace';ctx.fillStyle='#ff9d5d';
+    ctx.fillText('PATROL '+Math.round(dist(patrol.x,patrol.y,player.x,player.y))+'m',W-18,118);
+  }
+}
+
+/* ---- guarded local save / continue (localStorage, with fallback) ---- */
+function saveGame(){
+  if(!storageOK||state!=='walk'&&state!=='drive')return;
+  try{
+    localStorage.setItem(SAVE_KEY,JSON.stringify({
+      v:1,state:state,px:player.x,py:player.y,pa:player.a,
+      cargo:player.hasCargo,cargoHp:player.cargoHp,
+      hp:player.hp,mul:player.speedMul,
+      water:waterLevel,storm:stormPhase,mt:missionTimer,
+      route:routeChoice,gate:gatePassed,time,
+      discovered:[...discovered],
+      savedCats:cats.filter(c=>c.saved).map(c=>[c.x,c.y]),
+      lanternsGot:lanterns.filter(l=>l.got).map(l=>[l.x,l.y]),
+      lootedCarts:customsCarts.filter(c=>c.looted).map(c=>[c.x,c.y]),
+      runCount
+    }));
+  }catch(e){storageOK=false;}
+}
+function loadGame(){
+  try{
+    const raw=localStorage.getItem(SAVE_KEY);
+    if(!raw)return null;
+    const s=JSON.parse(raw);
+    if(!s||s.v!==1)return null;
+    return s;
+  }catch(e){storageOK=false;return null;}
+}
+function applySave(s){
+  // refuse a dead save (timer gone or cargo ruined): offer nothing stale
+  if((s.cargo&&s.mt<=0)||s.cargoHp<=0){clearSave();showMsg('that run was already over — starting fresh');return;}
+  state=s.state==='drive'?'walk':s.state; // resume on foot (car not saved)
+  player.x=s.px;player.y=s.py;player.a=s.pa;
+  player.hp=s.hp;player.stamina=1;player.inCar=null;
+  player.hasCargo=s.cargo;player.cargoHp=s.cargoHp;player.speedMul=s.mul;player.stepT=0;
+  waterLevel=s.water;stormPhase=s.storm;missionTimer=s.mt;
+  routeChoice=s.route;gatePassed=s.gate;time=s.time||0;
+  msgs=[];parts.length=0;splashes.length=0;puddleGlows.length=0;
+  flashT=0;shakeT=0;thunderT=0;
+  wanted=0;wantedT=0;patrol=null;
+  // restore discoveries + per-run collectibles by position
+  discovered.clear();
+  for(const n of s.discovered||[])discovered.add(n);
+  const match=(list,pt)=>list.some(q=>q[0]===pt.x&&q[1]===pt.y);
+  for(const c of cats)c.saved=match(s.savedCats||[],c);
+  for(const l of lanterns)l.got=match(s.lanternsGot||[],l);
+  for(const c of customsCarts)c.looted=match(s.lootedCarts||[],c);
+  runCount=s.runCount||0;
+  renderMinimapFlood();
+  cam.x=player.x;cam.y=player.y;cam.zoom=targetZoom();
+  showMsg('continued saved run — supplies route intact',4);
+  if(player.hasCargo&&!routeChoice)showMsg('choose: fast flooded canal or safe hillside',3.5);
+}
+/* auto-save every ~5 s while playing; cleared on win/loss */
+setInterval(()=>{if(state==='walk'||state==='drive')saveGame();},5000);
+
+/* ---- rain (screen space) ---- */
+function ensureRain(){
+  while(raindrops.length<170)
+    raindrops.push({x:Math.random()*W,y:Math.random()*H,l:rr(10,22),s:rr(500,850)});
+}
+function updateRain(dt){
+  ensureRain();
+  const slant=140+stormPhase*160;
+  for(const d of raindrops){
+    d.y+=d.s*dt;d.x+=slant*dt;
+    if(d.y>H){d.y=-20;d.x=Math.random()*W;}
+    if(d.x>W)d.x-=W;
+  }
+}
+/* ========================= 8. RENDERING ========================== */
+function shade(hex,amt){
+  const n=parseInt(hex.slice(1),16);
+  return`rgb(${clamp(((n>>16)&255)+amt,0,255)},${clamp(((n>>8)&255)+amt,0,255)},${clamp((n&255)+amt,0,255)})`;
+}
+function rrect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();
+}
+function drawGround(x0,y0,x1,y1){
+  ctx.fillStyle='#0e2438';ctx.fillRect(x0,y0,x1-x0,y1-y0); // sea
+  ctx.fillStyle='#191d26';
+  ctx.fillRect(Math.max(x0,10),Math.max(y0,10),
+    Math.min(x1,WORLD-10)-Math.max(x0,10),Math.min(y1,WORLD-10)-Math.max(y0,10));
+  forBlocksInRange(x0,y0,x1,y1,b=>{
+    if(b.type==='park'){ctx.fillStyle='#1d2b22';ctx.fillRect(b.ox,b.oy,310,310);}
+    else if(b.type==='lot'){ctx.fillStyle='#23262e';ctx.fillRect(b.ox,b.oy,310,310);}
+    else{ctx.fillStyle='#20242e';ctx.fillRect(b.ox,b.oy,310,310);}
+  });
+  // road lane dashes
+  ctx.strokeStyle='rgba(230,200,90,0.5)';ctx.lineWidth=3;ctx.setLineDash([16,20]);
+  const i0=clamp(Math.floor((x0-100)/400),0,9),i1=clamp(Math.ceil(x1/400),0,9);
+  const j0=clamp(Math.floor((y0-100)/400),0,9),j1=clamp(Math.ceil(y1/400),0,9);
+  for(let i=i0;i<=i1;i++)for(let j=0;j<GRIDB;j++){
+    const ya=rc(j)+45,yb=rc(j+1)-45;
+    if(yb<y0||ya>y1)continue;
+    ctx.beginPath();ctx.moveTo(rc(i),ya);ctx.lineTo(rc(i),yb);ctx.stroke();
+  }
+  for(let j=j0;j<=j1;j++)for(let i=0;i<GRIDB;i++){
+    const xa=rc(i)+45,xb=rc(i+1)-45;
+    if(xb<x0||xa>x1)continue;
+    ctx.beginPath();ctx.moveTo(xa,rc(j));ctx.lineTo(xb,rc(j));ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  // canal
+  ctx.fillStyle='#0e2438';
+  ctx.fillRect(CANAL.x0,CANAL.y0,CANAL.x1-CANAL.x0,WORLD-CANAL.y0);
+  ctx.strokeStyle='#3d4657';ctx.lineWidth=6;
+  ctx.strokeRect(CANAL.x0,CANAL.y0,CANAL.x1-CANAL.x0,WORLD-CANAL.y0);
+  // bridge planks
+  if(BRIDGE.y1>y0&&BRIDGE.y0<y1&&CANAL.x1>x0&&CANAL.x0<x1){
+    ctx.fillStyle='#6b4a33';
+    ctx.fillRect(1080,BRIDGE.y0,440,BRIDGE.y1-BRIDGE.y0);
+    ctx.fillStyle='#7d5a40';
+    for(let k=0;k<11;k++)ctx.fillRect(1080+k*40,BRIDGE.y0,26,BRIDGE.y1-BRIDGE.y0);
+    ctx.strokeStyle='#caa76a';ctx.lineWidth=3;
+    ctx.strokeRect(1080,BRIDGE.y0,440,BRIDGE.y1-BRIDGE.y0);
+  }
+  // flood water: animated translucent water over anything below water level
+  const t=time;
+  for(let gi=0;gi<EG;gi++)for(let gj=0;gj<EG;gj++){
+    if(bridgeG[gi][gj])continue;
+    const e=elevG[gi][gj];
+    if(e>=waterLevel)continue;
+    const wx=gi*ECELL,wy=gj*ECELL;
+    if(wx>x1||wx+ECELL<x0||wy>y1||wy+ECELL<y0)continue;
+    const depth=clamp((waterLevel-e)*2.5,0,1);
+    const wob=Math.sin(t*1.7+gi*1.3+gj*0.7)*0.5+0.5;
+    ctx.fillStyle=`rgba(24,86,152,${0.25+depth*0.34+wob*0.07})`;
+    ctx.fillRect(wx,wy,ECELL,ECELL);
+    // wave highlight lines
+    if(depth>0.3){
+      ctx.strokeStyle=`rgba(140,200,255,${0.05+0.07*wob})`;
+      ctx.lineWidth=2;
+      ctx.beginPath();
+      ctx.moveTo(wx+8,wy+50+Math.sin(t*2+gi)*8);
+      ctx.lineTo(wx+ECELL-8,wy+50+Math.cos(t*1.6+gj)*8);
+      ctx.stroke();
+    }
+  }
+  // splashes (world-space ripples)
+  for(const s of splashes){
+    ctx.strokeStyle=`rgba(150,210,255,${s.a})`;ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(s.x,s.y,s.r,0,TAU);ctx.stroke();
+  }
+}
+function drawBuildings(x0,y0,x1,y1){
+  forBlocksInRange(x0,y0,x1,y1,b=>{
+    for(const bd of b.buildings){
+      const k=bd.hgt*0.0009;
+      const dx=(bd.cx-cam.x)*k,dy=(bd.cy-cam.y)*k;
+      ctx.fillStyle='rgba(0,0,0,0.4)';
+      ctx.fillRect(bd.x+7,bd.y+7,bd.w,bd.h);
+      // extruded walls: quads linking base corners to roof corners
+      const wall=(x1,y1,x2,y2,col)=>{
+        ctx.fillStyle=col;
+        ctx.beginPath();
+        ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);
+        ctx.lineTo(x2+dx,y2+dy);ctx.lineTo(x1+dx,y1+dy);
+        ctx.closePath();ctx.fill();
+      };
+      wall(bd.x,bd.y,bd.x+bd.w,bd.y,shade(bd.color,-14));            // north
+      wall(bd.x+bd.w,bd.y,bd.x+bd.w,bd.y+bd.h,shade(bd.color,-32)); // east
+      wall(bd.x+bd.w,bd.y+bd.h,bd.x,bd.y+bd.h,shade(bd.color,-46)); // south
+      wall(bd.x,bd.y+bd.h,bd.x,bd.y,shade(bd.color,-28));           // west
+      ctx.fillStyle=shade(bd.color,-24);
+      ctx.fillRect(bd.x+dx,bd.y+dy,bd.w,bd.h);          // roof
+      ctx.strokeStyle=shade(bd.color,-50);ctx.lineWidth=2;
+      ctx.strokeRect(bd.x+dx+5,bd.y+dy+5,bd.w-10,bd.h-10);
+      // neon sign: vertical bar on the wall facing screen bottom
+      if(bd.neon){
+        const fl=(Math.sin(time*7+bd.cx*0.05)+Math.sin(time*13+bd.cy*0.03))>-2?1:0.75;
+        const alpha=fl*(0.75+0.25*Math.sin(time*3+bd.cx));
+        ctx.fillStyle=bd.neon;
+        ctx.globalAlpha=0.28*alpha;
+        ctx.fillRect(bd.x+dx+6,bd.y+dy+6,bd.w-12,bd.h-12);
+        ctx.globalAlpha=alpha;
+        ctx.fillRect(bd.x+dx+bd.w*0.5-3,bd.y+bd.h+2,6,Math.min(34,bd.hgt*0.4));
+        ctx.globalAlpha=1;
+      }
+    }
+    for(const tr of b.trees){
+      const dx=(tr.x-cam.x)*0.03,dy=(tr.y-cam.y)*0.03;
+      ctx.fillStyle='rgba(0,0,0,0.35)';
+      ctx.beginPath();ctx.arc(tr.x+5,tr.y+5,tr.r,0,TAU);ctx.fill();
+      ctx.fillStyle='#22402a';
+      ctx.beginPath();ctx.arc(tr.x+dx*0.4,tr.y+dy*0.4,tr.r,0,TAU);ctx.fill();
+    }
+  });
+}
+function drawCar(c){
+  ctx.save();ctx.translate(c.x,c.y);ctx.rotate(c.angle);
+  ctx.fillStyle='rgba(0,0,0,0.35)';
+  rrect(-24,-12+4,48,24,5);ctx.fill();
+  ctx.fillStyle=c.dead?'#26262b':c.color;
+  rrect(-24,-12,48,24,5);ctx.fill();
+  if(!c.dead){
+    ctx.fillStyle='rgba(25,35,50,0.9)';
+    rrect(-7,-9,16,18,3);ctx.fill();
+    ctx.fillStyle=shade(c.color,-28);
+    rrect(-20,-10,9,20,3);ctx.fill();
+    ctx.fillStyle='#ffe9a0';ctx.fillRect(21,-10,3,4);ctx.fillRect(21,6,3,4);
+    ctx.fillStyle='#c03030';ctx.fillRect(-25,-10,2,4);ctx.fillRect(-25,6,2,4);
+    if(c.van){
+      // cargo crate in the van bed
+      ctx.fillStyle=player.hasCargo?'#e8e0c8':'#3a3f4a';
+      rrect(-22,-9,12,18,2);ctx.fill();
+      ctx.strokeStyle='#8a5a2a';ctx.lineWidth=2;
+      ctx.strokeRect(-21,-8,10,16);
+    }
+  }
+  ctx.restore();
+}
+function drawPlayer(){
+  if(player.inCar)return;
+  ctx.save();ctx.translate(player.x,player.y);
+  ctx.fillStyle='rgba(0,0,0,0.4)';ctx.beginPath();ctx.arc(3,3,9,0,TAU);ctx.fill();
+  ctx.rotate(player.a);
+  ctx.fillStyle=player.hasCargo?'#3d6b4f':'#2b3d5c';
+  ctx.beginPath();ctx.arc(0,0,9,0,TAU);ctx.fill();
+  ctx.fillStyle='#e0b089';ctx.beginPath();ctx.arc(3,0,5,0,TAU);ctx.fill();
+  if(player.hasCargo){ // backpack crate
+    ctx.fillStyle='#c8a05a';rrect(-11,-6,7,12,2);ctx.fill();
+    ctx.strokeStyle='#7a5a2a';ctx.lineWidth=1.5;ctx.strokeRect(-10.5,-5.5,6,11);
+  }
+  // walking bob
+  const bob=Math.sin(player.stepT)*1.5;
+  ctx.translate(bob*0.3,0);
+  ctx.restore();
+}
+function drawCatsLanterns(){
+  for(const l of lanterns){
+    if(l.got)continue;
+    const bob=Math.sin(time*3+l.t)*3;
+    ctx.save();ctx.translate(l.x,l.y+bob);
+    ctx.fillStyle='rgba(255,190,80,0.15)';
+    ctx.beginPath();ctx.arc(0,0,22,0,TAU);ctx.fill();
+    ctx.fillStyle='#5a3a1a';rrect(-5,-8,10,16,2);ctx.fill();
+    ctx.fillStyle='#ffd88a';ctx.fillRect(-3,-6,6,12);
+    ctx.restore();
+  }
+  for(const cat of cats){
+    if(cat.saved)continue;
+    ctx.save();ctx.translate(cat.x,cat.y);
+    ctx.fillStyle='rgba(0,0,0,0.35)';ctx.beginPath();ctx.arc(2,2,6,0,TAU);ctx.fill();
+    ctx.rotate(cat.a+Math.sin(time*2+cat.t)*0.2);
+    ctx.fillStyle='#2a2a30';
+    ctx.beginPath();ctx.ellipse(0,0,7,4.5,0,0,TAU);ctx.fill();
+    ctx.beginPath();ctx.arc(6,0,3.4,0,TAU);ctx.fill();
+    ctx.restore();
+  }
+}
+function drawMarkers(){
+  const pulse=1+Math.sin(time*4)*0.12;
+  const mk=(p,col,rs)=>{
+    ctx.strokeStyle=col;ctx.lineWidth=4;
+    ctx.beginPath();ctx.arc(p.x,p.y,26*pulse,0,TAU);ctx.stroke();
+    ctx.fillStyle=col.replace('1)','0.22)');
+    ctx.beginPath();ctx.arc(p.x,p.y,26*pulse,0,TAU);ctx.fill();
+    if(rs){
+      ctx.fillStyle=col;
+      ctx.beginPath();ctx.moveTo(p.x,p.y-40*pulse);ctx.lineTo(p.x-10,p.y-54*pulse);
+      ctx.lineTo(p.x+10,p.y-54*pulse);ctx.closePath();ctx.fill();
+    }
+  };
+  const ph=phase();
+  if(ph==='pickup'){
+    mk({x:2200,y:2400},'rgba(255,210,60,1)',true);
+  }else if(ph==='route'||ph==='deliver'){
+    mk(HOSPITAL,'rgba(255,93,93,1)',true);
+    if(ph==='route'){
+      // nudge arrows to both route starts
+      mk({x:1800,y:3400},'rgba(120,220,255,1)',false);
+      mk({x:3400,y:1000},'rgba(120,255,180,1)',false);
+    }
+  }
+}
+function drawPuddleGlows(){
+  for(const p of puddleGlows){
+    const a=clamp(Math.sin(Math.PI*clamp(p.t/6,0,1)),0,1)*0.16;
+    if(a<=0.01)continue;
+    ctx.fillStyle=p.col;ctx.globalAlpha=a;
+    ctx.beginPath();ctx.ellipse(p.x,p.y,30,16,0,0,TAU);ctx.fill();
+    ctx.globalAlpha=1;
+  }
+}
+function drawRain(){
+  ctx.strokeStyle='rgba(170,200,230,0.34)';ctx.lineWidth=1.5;
+  ctx.beginPath();
+  const slant=140+stormPhase*160;
+  for(const d of raindrops){
+    ctx.moveTo(d.x,d.y);
+    ctx.lineTo(d.x-slant*0.024*d.l,d.y-d.l);
+  }
+  ctx.stroke();
+}
+function drawLightning(){
+  if(thunderT<=0)return;
+  const a=Math.sin(Math.PI*clamp(thunderT/0.22,0,1));
+  ctx.fillStyle=`rgba(200,220,255,${a*0.22})`;
+  ctx.fillRect(0,0,W,H);
+}
+function drawParts(){
+  for(const p of parts){
+    ctx.globalAlpha=clamp(p.life/p.max,0,1);
+    ctx.fillStyle=p.color;
+    ctx.fillRect(p.x-p.size/2,p.y-p.size/2,p.size,p.size);
+  }
+  ctx.globalAlpha=1;
+}
+
+/* ---- minimap + compass ---- */
+function drawMinimap(){
+  const s=mmScale,ox=16,oy=H-MM-16;
+  ctx.drawImage(mmBase,ox,oy);
+  ctx.drawImage(mmFlood,ox,oy);
+  ctx.strokeStyle='#5a6478';ctx.lineWidth=2;ctx.strokeRect(ox,oy,MM,MM);
+  const dot=(x,y,col,r)=>{
+    ctx.fillStyle=col;
+    ctx.beginPath();ctx.arc(ox+x*s,oy+y*s,r,0,TAU);ctx.fill();
+  };
+  // route lines
+  const route=routeChoice==='fast'?FAST_ROUTE:routeChoice==='safe'?SAFE_ROUTE:null;
+  const drawRoute=(pts,col)=>{
+    ctx.strokeStyle=col;ctx.lineWidth=3;ctx.setLineDash([6,5]);
+    ctx.beginPath();
+    pts.forEach((p,i)=>i?ctx.lineTo(ox+p[0]*s,oy+p[1]*s):ctx.moveTo(ox+p[0]*s,oy+p[1]*s));
+    ctx.stroke();ctx.setLineDash([]);
+  };
+  if(!routeChoice&&player.hasCargo){
+    drawRoute(FAST_ROUTE,'rgba(120,220,255,0.7)');
+    drawRoute(SAFE_ROUTE,'rgba(120,255,180,0.7)');
+  }else if(route)drawRoute(route,routeChoice==='fast'?'rgba(120,220,255,0.9)':'rgba(120,255,180,0.9)');
+  if(phase()==='pickup')dot(2200,2400,'#ffd23a',4);
+  if(player.hasCargo)dot(HOSPITAL.x,HOSPITAL.y,'#ff5d5d',4);
+  // unlooted customs carts as small orange dots, patrol as red
+  for(const cart of customsCarts)if(!cart.looted)dot(cart.x,cart.y,'#ff9d5d',2.5);
+  if(patrol)dot(patrol.x,patrol.y,'#ff3a3a',3.5);
+  dot(player.x,player.y,'#ffffff',4);
+  const dr=Math.atan2(HOSPITAL.y-player.y,HOSPITAL.x-player.x);
+  const px=player.x+Math.cos(dr)*30,py=player.y+Math.sin(dr)*30;
+  ctx.strokeStyle='#ff5d5d';ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(ox+player.x*s,oy+player.y*s);
+  ctx.lineTo(ox+px*s,oy+py*s);ctx.stroke();
+}
+function drawCompassBar(){
+  // top-centre compass strip showing hospital bearing
+  const bearing=Math.atan2(HOSPITAL.y-player.y,HOSPITAL.x-player.x);
+  const rel=normalizeAngle(bearing-camAngleForCompass());
+  const cx=W/2,w=300;
+  ctx.fillStyle='rgba(10,12,20,0.6)';rrect(cx-w/2,12,w,26,8);ctx.fill();
+  const px=cx+clamp(rel/(Math.PI/2),-1,1)*w/2;
+  ctx.fillStyle='#ff5d5d';
+  ctx.beginPath();ctx.moveTo(px,20);ctx.lineTo(px-7,32);ctx.lineTo(px+7,32);ctx.closePath();ctx.fill();
+  ctx.fillStyle='#888';ctx.font='10px monospace';ctx.textAlign='center';
+  ctx.fillText('HOSPITAL',cx,52);
+  const dm=Math.round(dist(player.x,player.y,HOSPITAL.x,HOSPITAL.y));
+  ctx.fillText(dm+'m',cx,64);
+}
+function camAngleForCompass(){return 0;}
+function normalizeAngle(a){while(a>Math.PI)a-=TAU;while(a<-Math.PI)a+=TAU;return a;}
+
+/* ---- HUD ---- */
+function drawHUD(){
+  ctx.setTransform(1,0,0,1,0,0);
+  // timer
+  const tCol=missionTimer<30?'#ff5d5d':'#ffd23a';
+  ctx.font='bold 30px monospace';ctx.textAlign='left';
+  ctx.fillStyle=tCol;
+  if(player.hasCargo)ctx.fillText(Math.max(0,missionTimer).toFixed(1)+'s',18,40);
+  else{ctx.font='bold 20px monospace';ctx.fillText('GET SUPPLIES',18,38);}
+  // cargo integrity
+  if(player.hasCargo){
+    ctx.fillStyle='#333';ctx.fillRect(18,50,190,12);
+    ctx.fillStyle=player.cargoHp>40?'#5dffc3':'#ff5d5d';
+    ctx.fillRect(20,52,186*clamp(player.cargoHp/100,0,1),8);
+    ctx.font='bold 12px monospace';ctx.fillStyle='#bbb';
+    ctx.fillText('SUPPLIES '+Math.round(player.cargoHp)+'%',18,78);
+  }else{
+    ctx.font='bold 13px monospace';ctx.fillStyle='#bbb';
+    ctx.fillText('collect the supplies at the Typhoon Spire (yellow blip)',18,72);
+  }
+  // flood meter
+  ctx.fillStyle='#333';ctx.fillRect(18,H-40,190,12);
+  ctx.fillStyle='#3d8fd1';
+  ctx.fillRect(20,H-38,186*clamp((waterLevel-0.2)/0.7,0,1),8);
+  ctx.font='bold 12px monospace';ctx.fillStyle='#8ab';ctx.textAlign='left';
+  ctx.fillText('TIDE',18,H-46);
+  // stamina pips (on foot)
+  if(!player.inCar){
+    ctx.fillStyle='#333';ctx.fillRect(W-208,H-40,190,12);
+    ctx.fillStyle='#9dffb0';ctx.fillRect(W-206,H-38,186*player.stamina,8);
+    ctx.fillStyle='#8a9';ctx.font='bold 12px monospace';ctx.textAlign='right';
+    ctx.fillText('SPRINT [SHIFT]',W-18,H-46);
+  }
+  // speedo (driving)
+  if(player.inCar){
+    ctx.font='bold 26px monospace';ctx.textAlign='right';
+    ctx.fillStyle='#dde';
+    ctx.fillText(Math.abs(Math.round(player.inCar.speed/4))+' km/h',W-18,40);
+    if(player.inCar.stall>0){
+      ctx.fillStyle='#ff5d5d';ctx.font='bold 16px monospace';
+      ctx.fillText('ENGINE FLOODING!',W-18,66);
+    }
+  }
+  // discovered count
+  ctx.font='bold 13px monospace';ctx.fillStyle='#8ab';ctx.textAlign='right';
+  ctx.fillText('landmarks '+discovered.size+'/'+landmarks.length,W-18,H-46-14);
+  // messages
+  ctx.textAlign='center';ctx.font='bold 18px monospace';
+  msgs.forEach((m,i)=>{
+    ctx.globalAlpha=clamp(m.t,0,1);
+    ctx.fillStyle='#fff';ctx.fillText(m.text,W/2,H-250+i*26);
+  });
+  ctx.globalAlpha=1;
+  // vignette + damage flash
+  if(flashT>0){
+    ctx.fillStyle=`rgba(180,40,40,${flashT*0.3})`;
+    ctx.fillRect(0,0,W,H);
+  }
+  const vg=ctx.createRadialGradient(W/2,H/2,Math.min(W,H)*0.42,W/2,H/2,Math.max(W,H)*0.72);
+  vg.addColorStop(0,'rgba(0,0,0,0)');vg.addColorStop(1,'rgba(2,4,10,0.55)');
+  ctx.fillStyle=vg;ctx.fillRect(0,0,W,H);
+  drawMinimap();
+  if(player.hasCargo)drawCompassBar();
+}
+
+/* ---- overlays ---- */
+function drawTitle(){
+  ctx.setTransform(1,0,0,1,0,0);
+  // animated neon title backdrop
+  const t=performance.now()/1000;
+  ctx.fillStyle='#0a0d14';ctx.fillRect(0,0,W,H);
+  for(let i=0;i<30;i++){
+    const a=t*0.1+i*(TAU/30);
+    ctx.fillStyle=`hsla(${(i*12+t*14)%360},70%,55%,0.10)`;
+    ctx.fillRect(W/2+Math.cos(a)*(W*0.36)-18,H/2+Math.sin(a*1.3)*(H*0.3)-18,36,36);
+  }
+  ctx.textAlign='center';
+  ctx.font='bold 78px monospace';
+  ctx.fillStyle='#39f2ff';
+  ctx.shadowColor='#39f2ff';ctx.shadowBlur=24;
+  ctx.fillText('NEON TIDE',W/2,H/2-140);
+  ctx.shadowBlur=0;
+  ctx.font='bold 17px monospace';ctx.fillStyle='#aab6cc';
+  ctx.fillText('a typhoon-night delivery across a flooding harbour city',W/2,H/2-104);
+  ctx.font='15px monospace';ctx.fillStyle='#cdd6e6';
+  const lines=[
+    'WASD / arrows — move · drive      SHIFT — sprint      F — enter / exit vehicles',
+    'E — interact (supplies, cats, lanterns, delivery — and customs carts, if you dare)',
+    'SPACE — brake (in car)      P — pause      M — mute      R — quick restart',
+    '',
+    'A typhoon is shoving the sea into the low districts. Pick up emergency supplies',
+    'at the Typhoon Spire, then choose: the fast flooded canal route, or the long',
+    'dry hillside route. Deliver to Mercy Ridge Hospital before the timer runs out.',
+    'Raiding a customs cart is optional arcade mischief: it raises your wanted stars',
+    'and calls one patrol — outrun it or wait out the heat. The delivery never suffers.'
+  ];
+  lines.forEach((l,i)=>ctx.fillText(l,W/2,H/2-60+i*24));
+  ctx.font='bold 22px monospace';ctx.fillStyle='#7ee87e';
+  if(Math.floor(performance.now()/500)%2===0)ctx.fillText('— CLICK OR PRESS ENTER TO START —',W/2,H/2+150);
+  const saved=(storageOK&&loadGame())?loadGame():null;
+  if(saved){
+    ctx.font='bold 17px monospace';ctx.fillStyle='#5dffc3';
+    ctx.fillText('C — continue saved run ('+(saved.cargo?'supplies aboard, ':'')+
+      Math.max(0,Math.round(saved.mt))+'s left'+(saved.route?', '+saved.route+' route':'')+')',W/2,H/2+182);
+    ctx.font='13px monospace';ctx.fillStyle='#889';
+    ctx.fillText('(a fresh start begins a new run; the save clears when a run ends)',W/2,H/2+204);
+  }else{
+    ctx.font='13px monospace';ctx.fillStyle='#667';
+    ctx.fillText(storageOK?'':'(local save unavailable — storage blocked; play normally)',W/2,H/2+182);
+  }
+  if(runCount>0){
+    ctx.font='14px monospace';ctx.fillStyle='#889';
+    ctx.fillText('runs: '+runCount+'  ·  landmarks discovered: '+discovered.size+'/'+landmarks.length,W/2,H/2+185);
+  }
+}
+function drawIntro(){
+  // short cinematic pan from harbour to spire, then control hand-off
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle='#0a0d14';ctx.fillRect(0,0,W,H);
+  const s=Math.min(W,H)/900;
+  const seq=[
+    {t:0,   x:3400,y:3600,z:s*1.1,text:'TYPHOON KURI MAKES LANDFALL TONIGHT'},
+    {t:2.2, x:3400,y:3600,z:s*1.1,text:'the harbour depot is evacuating'},
+    {t:4.4, x:2200,y:2500,z:s*0.9,text:'emergency supplies wait at the Typhoon Spire'},
+    {t:6.6, x:600, y:1800,z:s*1.0,text:'Mercy Ridge Hospital needs them before high tide'}
+  ];
+  let cur=seq[0],idx=0;
+  for(let i=0;i<seq.length;i++)if(introT>=seq[i].t){cur=seq[i];idx=i;}
+  const nxt=seq[idx+1];
+  let x=cur.x,y=cur.y,z=cur.z,text=cur.text;
+  if(nxt){
+    const k=clamp((introT-cur.t)/ (nxt.t-cur.t),0,1);
+    const e=k*k*(3-2*k);
+    x=lerp(cur.x,nxt.x,e);y=lerp(cur.y,nxt.y,e);z=lerp(cur.z,nxt.z,e);
+  }
+  ctx.setTransform(z,0,0,z,W/2-x*z,H/2-y*z);
+  const x0=x-W/2/z-40,y0=y-H/2/z-40,x1=x+W/2/z+40,y1=y+H/2/z+40;
+  drawGround(x0,y0,x1,y1);
+  drawCustoms();
+  drawTraffic();
+  for(const c of cars)drawCar(c);
+  drawBuildings(x0,y0,x1,y1);
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle='rgba(5,8,14,0.5)';ctx.fillRect(0,H*0.72,W,H*0.28);
+  ctx.textAlign='center';ctx.font='bold 24px monospace';ctx.fillStyle='#dde6f2';
+  ctx.fillText(text,W/2,H*0.85);
+  ctx.font='13px monospace';ctx.fillStyle='#889';
+  ctx.fillText('click or press ENTER to skip',W/2,H*0.92);
+  if(introT>8.8||keys['Enter']||introSkip){beginPlay();}
+}
+function drawWon(){
+  ctx.setTransform(1,0,0,1,0,0);
+  const sc=window._lastScore||{};
+  ctx.fillStyle='rgba(4,10,8,0.72)';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.font='bold 64px monospace';ctx.fillStyle='#5dffc3';
+  ctx.shadowColor='#5dffc3';ctx.shadowBlur=18;
+  ctx.fillText('DELIVERED',W/2,H/2-170);
+  ctx.shadowBlur=0;
+  if(sc.fail===undefined){
+    ctx.font='bold 20px monospace';ctx.fillStyle='#dde';
+    ctx.fillText('route taken: '+(sc.route==='fast'?'FAST (flooded canal)':'SAFE (hillside)'),W/2,H/2-120);
+    const rows=[
+      ['base reward',1200],
+      ['supplies intact ('+sc.cargoHp+'%)',sc.cargoBonus],
+      ['time remaining',sc.timeLeft],
+      ['risk bonus',sc.riskBonus],
+      ['cats rescued x'+sc.cats,sc.catBonus]
+    ];
+    ctx.font='17px monospace';
+    rows.forEach((r,i)=>{
+      ctx.fillStyle='#9ab';ctx.textAlign='right';
+      ctx.fillText(r[0],W/2-20,H/2-70+i*30);
+      ctx.fillStyle='#ffd23a';ctx.textAlign='left';
+      ctx.fillText('+$'+r[1],W/2+20,H/2-70+i*30);
+    });
+    ctx.textAlign='center';ctx.font='bold 30px monospace';ctx.fillStyle='#7ee87e';
+    ctx.fillText('TOTAL  $'+sc.total,W/2,H/2+110);
+  }
+  ctx.font='bold 18px monospace';ctx.fillStyle='#ccd';
+  ctx.fillText('R — run it again (quick restart)',W/2,H/2+170);
+  ctx.font='14px monospace';ctx.fillStyle='#889';
+  ctx.fillText('landmarks discovered: '+discovered.size+'/'+landmarks.length,W/2,H/2+200);
+}
+function drawLost(){
+  ctx.setTransform(1,0,0,1,0,0);
+  const sc=window._lastScore||{};
+  ctx.fillStyle='rgba(12,4,6,0.72)';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.font='bold 64px monospace';ctx.fillStyle='#ff5d5d';
+  ctx.shadowColor='#ff5d5d';ctx.shadowBlur=18;
+  const title=sc.fail==='time'?'OUT OF TIME':sc.fail==='cargo'?'SUPPLIES RUINED'
+    :sc.fail==='drown'?'SWALLOWED BY THE TIDE':'THE VAN DROWNED';
+  ctx.fillText(title,W/2,H/2-100);
+  ctx.shadowBlur=0;
+  ctx.font='bold 18px monospace';ctx.fillStyle='#dde';
+  const why=sc.fail==='time'?'the hospital needed those supplies before high tide.'
+    :sc.fail==='cargo'?'the medical crates soaked through in the flood.'
+    :'deep floodwater claimed you'+(sc.route==='fast'?' on the fast route.':'.');
+  ctx.fillText(why,W/2,H/2-50);
+  ctx.font='bold 18px monospace';ctx.fillStyle='#ccd';
+  ctx.fillText('R — quick restart',W/2,H/2+10);
+}
+
+/* ====================== 9. GAME FLOW ============================ */
+let introT=0,introSkip=false;
+function beginPlay(){
+  state='walk';
+  showMsg('reach the Typhoon Spire — yellow blip on the minimap',5);
+}
+function clearSave(){
+  try{localStorage.removeItem(SAVE_KEY);}catch(e){storageOK=false;}
+}
+function quickRestart(){
+  runCount++;
+  // reset run state; city layout (seeded) and discoveries persist
+  player.x=3400;player.y=3560;player.a=-Math.PI/2;
+  player.hp=100;player.stamina=1;player.inCar=null;
+  player.hasCargo=false;player.cargoHp=100;player.speedMul=1;player.stepT=0;
+  waterLevel=0.22;stormPhase=0.25;time=0;
+  missionTimer=100;routeChoice=null;gatePassed=false;
+  msgs=[];parts.length=0;splashes.length=0;puddleGlows.length=0;
+  flashT=0;shakeT=0;thunderT=0;
+  wanted=0;wantedT=0;patrol=null;traffic.length=0; // heat layer reset
+  spawnProps();      // fresh van, cats, lanterns, parked cars
+  renderMinimapFlood();
+  cam.x=player.x;cam.y=player.y;cam.zoom=targetZoom();
+  state='walk';
+  showMsg('run #'+runCount+' — supplies at the Typhoon Spire',4);
+}
+addEventListener('keydown',e=>{
+  if(e.code==='Enter'){
+    if(state==='title'){initAudio();state='intro';introT=0;introSkip=false;}
+    else if(state==='intro')introSkip=true;
+  }
+  if(e.code==='KeyC'&&state==='title'){
+    const s=storageOK?loadGame():null;
+    if(s){initAudio();applySave(s);}
+    else showMsg('no saved run found');
+  }
+});
+canvas.addEventListener('mousedown',()=>{
+  initAudio();
+  if(state==='title'){state='intro';introT=0;introSkip=false;}
+  else if(state==='intro')introSkip=true;
+});
+
+/* ---- init ---- */
+function init(){
+  genCity();
+  spawnProps();
+  renderMinimapBase();
+  renderMinimapFlood();
+  missionTimer=100;
+  cam.x=player.x;cam.y=player.y;cam.zoom=targetZoom();
+}
+init();
+
+/* ---- main loop ---- */
+let last=performance.now();
+function frame(now){
+  requestAnimationFrame(frame);
+  const dt=clamp((now-last)/1000,0,0.05);
+  last=now;
+  if(state==='title'){drawTitle();return;}
+  if(state==='intro'){introT+=dt;updateRain(dt);drawIntro();return;}
+  if(state==='walk'||state==='drive'){
+    if(!paused){
+      time+=dt;
+      if(state==='walk')updateWalk(dt);else updateCar(dt);
+      updateWorld(dt);
+      updateTraffic(dt);
+      updatePatrol(dt);
+      updateRain(dt);
+    }
+    updateCamera(dt);
+    updateEngineSound();
+    render();
+    if(paused){
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.fillStyle='rgba(0,0,0,0.55)';ctx.fillRect(0,0,W,H);
+      ctx.textAlign='center';ctx.font='bold 48px monospace';ctx.fillStyle='#dde';
+      ctx.fillText('PAUSED',W/2,H/2);
+      ctx.font='16px monospace';ctx.fillStyle='#99a';
+      ctx.fillText('P — resume   ·   M — mute',W/2,H/2+40);
+    }
+  }else{
+    // won / lost: keep the rain falling behind the overlay
+    time+=dt;updateWorld(dt);updateRain(dt);updateCamera(dt);render();
+    if(state==='won')drawWon();else drawLost();
+  }
+}
+function render(){
+  const s=cam.zoom;
+  let shx=0,shy=0;
+  if(shakeT>0){shx=rr(-1,1)*shakeAmp*shakeT*4;shy=rr(-1,1)*shakeAmp*shakeT*4;}
+  ctx.setTransform(s,0,0,s,W/2-cam.x*s+shx,H/2-cam.y*s+shy);
+  const x0=cam.x-W/2/s-60,y0=cam.y-H/2/s-60,x1=cam.x+W/2/s+60,y1=cam.y+H/2/s+60;
+  drawGround(x0,y0,x1,y1);
+  drawMarkers();
+  drawCatsLanterns();
+  drawCustoms();
+  drawPuddleGlows();
+  drawTraffic();
+  for(const c of cars)if(c.x>x0&&c.x<x1&&c.y>y0&&c.y<y1)drawCar(c);
+  drawPlayer();
+  drawParts();
+  drawBuildings(x0,y0,x1,y1);
+  ctx.setTransform(1,0,0,1,0,0); // rain/lightning/HUD are screen-space
+  drawRain();
+  drawLightning();
+  drawHUD();
+  drawWanted();
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "neon-tide",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "NEON TIDE — an offline, self-contained typhoon-night delivery game. Original assets only.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node serve.ts",
+    "preview": "node serve.ts",
+    "package": "node main.ts"
+  }
+}
